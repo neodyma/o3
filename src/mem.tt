@@ -1,0 +1,136 @@
+// o3 RISC simulator
+// 
+// memory management
+// - template implementation
+//
+// Lukas Heine 2021
+
+#include <bit>
+
+namespace MM
+{
+    typedef enum
+    {
+        p_r = 0x01, // read
+        p_w = 0x02, // write
+        p_x = 0x04, // execute
+    } rwx_bits;
+}
+
+// read type T from memory, return T and latency
+template<typename T>
+std::pair<T, u64> MemoryManager::read(u64 vaddr, u8 rx)
+{
+    util::log(LOG_MM_EXEC, "MMU_:   Trying to read ", dec_u<0>, sizeof(T), " bytes from v.",
+        hex_u<64>, vaddr, ".");
+
+    // speculative read?
+    // -> no: exception, then restart from commit if pl matches
+    // check page bounds!!!!!
+    if((vaddr > VADDR_LIMIT)) throw InvalidPageaddrException();
+    if(!pagetable.count(pageFloor(vaddr))) throw PageNotMappedException(); // #PF
+
+    u64      latency = 0;
+    wT<T> w;
+    try
+    {
+        if((pageOffs(vaddr) + sizeof(T)) > mem.at(pageFloor(get_paddr(vaddr, rx))).bytes_used)
+        {
+            util::log(LOG_MM_EXEC, "MMU_:   Read across bounds detected.");
+
+            size_t pagebytes = mem.at(pageFloor(get_paddr(vaddr, rx))).bytes_used - pageOffs(vaddr); // bytes on page
+            size_t rem_bytes = sizeof(T); // total bytes remaining
+            size_t offset    = 0;         // offset from vaddr
+
+            // // test memory before reading
+            // get_eaddr(vaddr, rx);
+            // get_eaddr(vaddr + rem_bytes - 1, rx);
+
+            for(;rem_bytes > 0;)
+            {
+                std::memcpy((void*)((uptr)w.b + offset), get_eaddr(vaddr + offset, rx), pagebytes);
+
+                // we can't read any further if this is a partial page! successive vaddrs are invalid
+                if(mem.at(pageFloor(get_paddr(vaddr + offset, rx))).bytes_used < PAGE_SIZE) [[unlikely]]
+                {
+                    util::log(LOG_MM_EXEC, "MMU_:   End of mapped region reached, type may be incomplete.");
+                    break;
+                }
+
+                offset    += pagebytes;
+                rem_bytes -= pagebytes;
+                pagebytes =  (rem_bytes <= PAGE_SIZE) ? rem_bytes : PAGE_SIZE;
+            }
+        }
+        else std::memcpy(w.b, get_eaddr(vaddr, rx), sizeof(T));
+
+        latency = MM_LD_LATENCY;
+    } // rethrow any exceptions caused by address lookups
+    catch(const MemoryManagerException& mme) { throw; }
+
+    util::log(LOG_MM_EXEC, "MMU_:   Read successful, latency ", dec_u<0>, latency, " cycles.");
+
+    // if(0) throw AlignmentViolationException(); -> check and throw before trying to read
+    // if(0) throw PageNotPresentException(); // #PF // all pages are present for now
+
+    return std::make_pair( std::bit_cast<T>(w), latency );
+}
+
+// read type T from memory
+template<typename T>
+T MemoryManager::readT(u64 vaddr, u8 rx)
+{
+    try { return read<T>(vaddr, rx).first; }
+    catch(const MemoryManagerException& mme) { throw; }
+}
+
+// write type T to memory
+template<typename T>
+void MemoryManager::write(u64 vaddr, T val)
+{
+    util::log(LOG_MM_EXEC, "MMU_:   Trying to write ", dec_u<0>, sizeof(T), " bytes to v.",
+        hex_u<64>, vaddr, ".");
+
+    if((vaddr > VADDR_LIMIT)) throw InvalidPageaddrException();
+    if(!pagetable.count(pageFloor(vaddr))) throw PageNotMappedException();
+
+    wT<T> w = std::bit_cast<wT<T>>(val);
+
+    try
+    {
+        if((pageOffs(vaddr) + sizeof(T)) > mem.at(pageFloor(get_paddr(vaddr, MM::p_w))).bytes_used)
+        {
+            util::log(LOG_MM_EXEC, "MMU_:   Write across bounds detected.");
+
+            size_t pagebytes = mem.at(pageFloor(get_paddr(vaddr, MM::p_w))).bytes_used - pageOffs(vaddr);
+            size_t rem_bytes = sizeof(T); // total bytes remaining
+            size_t offset    = 0;         // offset from vaddr
+
+            // // test memory before actually writing anything
+            // get_eaddr(vaddr, MM::p_w);
+            // get_eaddr(vaddr + rem_bytes - 1, MM::p_w);
+
+            for(;rem_bytes > 0;)
+            {
+                std::memcpy(get_eaddr(vaddr + offset, MM::p_w), (void*)((uptr)w.b + offset), pagebytes);
+
+                // we can't write any further if this is a partial page! successive vaddrs are invalid
+                if(mem.at(pageFloor(get_paddr(vaddr + offset, MM::p_w))).bytes_used < PAGE_SIZE) [[unlikely]]
+                {
+                    util::log(LOG_MM_EXEC, "MMU_:   End of mapped region reached!");
+                    break;
+                }
+
+                offset    += pagebytes;
+                rem_bytes -= pagebytes;
+                pagebytes =  (rem_bytes <= PAGE_SIZE) ? rem_bytes : PAGE_SIZE;
+            }
+        }
+        else std::memcpy(get_eaddr(vaddr, MM::p_w), w.b, sizeof(T));
+    } // rethrow any exceptions caused by address lookups
+    catch(const MemoryManagerException& mme) { throw; }
+
+    util::log(LOG_MM_EXEC, "MMU_:   Write successful.");
+}
+
+// todo specialize?

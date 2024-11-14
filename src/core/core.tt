@@ -1,0 +1,2597 @@
+// o3 RISC simulator
+// 
+// out-of-order core
+// - template implementation
+// 
+// Lukas Heine 2021
+
+#ifndef SIM_CORE_T
+#define SIM_CORE_T
+
+// TODO remove this, just used for highlighting..
+#include "core.hh"
+
+// read T from N byte register
+template<u8 N>
+template<typename T>
+T Register<N>::read()
+{
+    // need this so registers don't overflow
+    size_t bytes = (N < sizeof(T)) ? N : sizeof(T);
+
+    wT<T> w;
+    std::memcpy(w.b, &content, bytes);
+    return std::bit_cast<T>(w);
+}
+
+template<u8 N>
+template<typename T>
+T Register<N>::read(size_t byteoffs)
+{
+    size_t bytes = (N < sizeof(T)) ? N : sizeof(T);
+
+    wT<T> w;
+    std::memcpy(w.b, (void*)((uptr)(&content) + byteoffs), bytes - byteoffs);
+    return std::bit_cast<T>(w);
+}
+
+template<u8 N>
+void Register<N>::read(void* data, size_t len)
+{
+    size_t bytes = (N < len) ? N : len;
+
+    std::memcpy(data, &content, bytes);
+}
+
+// write T to N byte register
+template<u8 N>
+template<typename T>
+void Register<N>::write(T val)
+{
+    size_t bytes = (N < sizeof(T)) ? N : sizeof(T);
+
+    wT<T> w = std::bit_cast<wT<T>>(val);
+    std::memcpy(&content, w.b, bytes);
+}
+
+template<u8 N>
+template<typename T>
+void Register<N>::write(T val, size_t byteoffs)
+{
+    size_t bytes = (N < sizeof(T)) ? N : sizeof(T);
+
+    wT<T> w = std::bit_cast<wT<T>>(val);
+    std::memcpy((void*)((uptr)(&content) + byteoffs), w.b, bytes - byteoffs);
+}
+
+// this should make operand size handling easier than with type variants
+template<u8 N>
+void Register<N>::write(void* data, size_t len)
+{
+    size_t bytes = (N < len) ? N : len;
+
+    std::memcpy(&content, data, bytes);
+}
+
+// execute convert uop between regfiles
+template<u8 N, u8 M>
+u8 run_cvt(ROBEntry& re, Register<N>* regfile1, Register<M>* regfile2)
+{
+    (void) re;
+    (void) regfile1;
+    (void) regfile2;
+    return 0;
+}
+
+// execute uop in given ROBEntry
+template<u8 N>
+u8 Core::run_uop(ROBEntry& re, Register<N>* regfile)
+{
+    util::log(LOG_CORE_UOP, "FU__:   Executing uop ", re.op);
+
+    u32 delay    = WB_LATENCY;                    // additional delay until uop is ready to commit
+    u8 add_delay = !!(re.op.control & imm_delay);
+
+    // writes to r0 will be discarded
+    Register<N>          tmprc = { std::byte {0} };
+    Register<N>          tmprd = { std::byte {0} };
+    Register<CCREG_SIZE> tmpcs = { std::byte {0} };
+
+    // rc_dest will always take precedence over use_rc if supported
+    u8 d_rc = !!(re.op.control & rc_dest);  // rc is dest
+    u8 u_ra = !!(re.op.control & use_ra);   // ra used
+    u8 u_rb = !!(re.op.control & use_rb);   // rb used
+    u8 u_rc = !!(re.op.control & use_rc);   // rc used
+    u8 u_im = !!(re.op.control & use_imm);  // im used
+
+    u8 u_cc = !!(re.op.control & use_cond); // uop uses condition 
+    u8 s_cc = !!(re.op.control & set_cond); // uop sets condition
+    // , [ccu]"rm"(*(u64*)ccu)
+
+    u64 flags = 0;
+
+    // 4 operands -> 4 seperate sets of flags might be set 
+    u64 tmpflags[4] = { 0 };
+
+    Register<CCREG_SIZE>* ccu = u_cc ? &prf.cc[re.cc_use] : &prf.cc[0]; // used cc reg
+    Register<CCREG_SIZE>* ccs = s_cc ? &prf.cc[re.cc_set] : &tmpcs;     // set cc reg
+
+    Register<N>* ra = &regfile[re.op.regs[r_ra]];
+    Register<N>* rb = &regfile[re.op.regs[r_rb]];
+    Register<N>* rc = d_rc ? (re.op.regs[r_rc] ? &regfile[re.op.regs[r_rc]] : &tmprc) :
+                        &regfile[re.op.regs[r_rc]];
+    Register<N>* rd = re.op.regs[r_rd] ? &regfile[re.op.regs[r_rd]] : &tmprd;
+
+    u8 opsz = getOpSize(re.op);
+    u8 adsz = 0;
+
+    // offsets for high byte registers (ah, ch, dh, bh)
+    u8 src_offs = ((opsz == 1) && (getOpClassId(re.op) == regs_gp) && (bit(63, re.op.imm)));
+    u8 dst_offs = ((opsz == 1) && (getOpClassId(re.op) == regs_gp) && (bit(62, re.op.imm)));
+
+    // for x64: zero extend all writes to dword registers
+    if((re.op.control & rd_extend) && (opsz == 4) && (getOpClassId(re.op) == regs_gp))
+    {
+        if(d_rc) asm("mov %[rc], 0"
+            : [rc]"=rm"(*(i64*)rc));
+        asm("mov %[rd], 0"
+            : [rd]"=rm"(*(i64*)rd));
+    }
+
+    // template operand size?
+    // pro: less redundancy, better readability, .. (100 loc per full uop might be a little excessive.....)
+    // con: a lot less flexible (keep other ISAs than x64 in mind (?)), not all opsizes are valid, ..
+
+    // pointer casts -> memcpy?
+    // neccessary when registers are configured to 32 bits
+
+    // uops for x64:
+    // - old register values should be in ra (if used) for consistency (aka ra == rd)
+    // -- this is important for correct handling of ah,ch,dh,bh!
+    // - ops on gp regs:
+    // -- 1/2 byte versions always need the old reg value and should mask upper bytes
+    // -- 4 byte doesn't use upper dword at all and should zero it
+    // -- 8 byte may use old value, this is just a normal dependency though
+    switch(re.op.opcode)
+    {
+        default: // in case we missed something in decode
+            re.except = setExcept(ex_UD, -1);
+            re.op.imm = UINT64_MAX;
+            break;
+
+
+        case uop_nop: // nop
+            // asm("nop");
+            break;
+
+
+        // interrupt/exception number in imm
+        case uop_int: // int
+            re.op.imm = ((getExceptNum(re.op.imm) > (u16)ex_MAX) ? (u64)ex_GP : re.op.imm);
+            re.except = re.op.imm;
+            break;
+
+
+        // high dword in rc, low in rd
+        case uop_rdtsc:
+            if(u_rc) rc->template write<u64>((state.cycle >> 32) & bitmask(32));
+            rd->template write<u64>(state.cycle & bitmask(32));
+            break;
+
+
+        // loads are executed when they are fetched from load queue:
+        // - set memory reference here
+        // - don't allow commit, load logic will set commit ready -> return, don't break
+        
+        // load value from vaddr in imm into rd
+        // high bytes are encoded in the opcode since all bits of imm may be used??
+        // or use same bits as always since they are free
+        case uop_ld64: // ld
+        case uop_ld64h:
+        {
+            dst_offs = ((opsz == 1) && (re.op.opcode & 0x1)) ? 8 : 0;
+            re.mref = { (void*)((uptr)rd + dst_offs), opsz, re.op.imm, MM::mr_read, MM::mr_exready };
+            return 0; // !!
+        }
+
+
+        // load value at ra (stack pointer) into rd, increment sp by opsz+imm and save it to rc
+        case uop_pop: // pop
+        {
+            u64 sp = ra->template read<u64>();
+
+            re.mref = { (void*)((uptr)rd + dst_offs), opsz, sp, MM::mr_read, MM::mr_exready };
+            if(d_rc) rc->template write<u64>(sp + opsz + (bitmask(16) & re.op.imm));
+
+            return 0;
+        }
+
+
+        // pop extended, only flags for now
+        case uop_popx: // popx
+        {
+            u64 sp = ra->template read<u64>();
+
+            // clear flags register
+            ccs->template write<u64>(0);
+            re.mref = { (void*)ccs, opsz, sp, MM::mr_read, MM::mr_exready };
+            if(d_rc) rc->template write<u64>(sp + opsz);
+
+            return 0;
+        }
+
+
+        // generate vaddr (see lea) and load from it
+        // lda does never have a dependence on old register contents!
+        // rd = (rc:)[ra + immhi * rb + immlo]
+        case uop_lda: // lda
+            [[fallthrough]];
+
+        // generate vaddr from base + scaled index + displacement (+ segbase)
+        // rd = (rc +) ra + immhi * rb + immlo
+        // ra: base, rb: index, rc: segbase, imm: (scale | displ)
+        // inputs should form a valid memory operand
+        // TODO 16b version has dependence on old reg value
+        case uop_lea: // lea
+        {
+            i64 acc = 0;
+            // imm: rh......|...delay|....adsz|.....scl|...........................displ
+            delay  += add_delay ? getImmDelay(re.op) : 0; // used for lea, not lda (lda is handled at alloc)
+
+            // segbase
+            if(u_rc) asm("add %[acc], %[rc];"
+                : [acc]"+rm"(acc)
+                : [rc]"rm"(*(i64*)rc));
+
+            // base address
+            if(u_ra) asm("add %[acc], %[ra];"
+                : [acc]"+rm"(acc)
+                : [ra]"rm"(*(i64*)ra));
+
+            // scale and/or displacement
+            if(u_im && (u_ra || u_rb))
+            {
+                adsz      = getLeaAdsz(re.op);
+                u64 scale = getLeaScale(re.op);
+                i64 displ = getLeaDispl(re.op);
+
+                util::log(LOG_CORE_UOP, "          effective address: ", hex_u<16>, *(u64*)rc, " + ", hex_u<64>, *(u64*)ra, " + ",
+                    hex_u<64>, *(u64*)rb, " * ", scale, " + ", displ);
+                asm("imul %[rb], %[scale]; add %[acc], %[rb]; add %[acc], %[displ]"
+                    : [acc]"+rm"(acc)
+                    : [rb]"r"(*(i64*)rb), [scale]"rm"(scale), [displ]"rm"(displ));
+            }
+            // rip-relative: displacement only
+            else if(!u_ra && !u_rb && !u_rc)
+            {
+                re.op.imm  = sx(re.op.imm, opsz, ADDR_SIZE/8);
+                util::log(LOG_CORE_UOP, "          rip-relative memory reference.");
+                util::log(LOG_CORE_UOP, "          = ", hex_u<64>, re.mref.vaddr);
+
+                acc = (i64)re.mref.vaddr + (i64)re.op.imm;
+            }
+            // == scale 1, no displacement, no address override
+            else asm("add %[acc], %[rb];"
+                    : [acc]"+rm"(acc)
+                    : [rb]"rm"(*(i64*)rb));
+
+            acc &= bitmask(adsz * 8); // truncate address if needed
+            util::log(LOG_CORE_UOP, "          = ", hex_u<64>, acc);
+
+            if(re.op.opcode == uop_lda)
+            {
+                // if we need alignment or canonical address checking, do it here and in store somehow like this
+                // if(acc % opsz)           re.except = ex_AC;
+                // if(!is_canonical(acc))   re.except = ex_GP(0); 
+                // ..
+
+                re.mref = { (void*)((uptr)rd + dst_offs), opsz, (u64)acc, MM::mr_read, MM::mr_exready };
+                return 0; // !
+            }
+            else asm("mov %[rd], %[acc]"
+                    : [rd]"=rm"(*(i64*)rd)
+                    : [acc]"rm"(acc));
+            break;
+        }
+
+
+        // stores are executed on commit, set memory reference here
+        // a commiting store will invalidate misspeculated loads
+
+        case uop_st: // st
+        {   // store address in ra, value in rb
+            // or address in imm, value in rb
+            // or address in ra, value in imm
+
+            // careful, this might conflict with stored immediate value!         
+            delay  += add_delay ? getImmDelay(re.op) : 0;
+
+            u64 vaddr = u_ra ? ra->template read<u64>() : u_im ? re.op.imm : 0;
+            void* val = u_rb ? (void*)((uptr)rb + src_offs) : (void*)&re.op.imm;
+
+            re.mref = { val, opsz, vaddr, MM::mr_write, MM::mr_unavail };
+            break;
+        }
+
+
+        // store value in rb/imm to decremented stack pointer in ra and save sp to rd
+        case uop_push: // push
+        {
+            u64 sp = ra->template read<u64>() - opsz;
+            void* val = u_rb ? (void*)((uptr)rb + src_offs) : (void*)&re.op.imm;
+
+            re.mref = { val, opsz, sp, MM::mr_write, MM::mr_unavail };
+            rd->template write<u64>(sp);
+
+            break; // store can commit
+        }
+
+
+        // push extended: flags/rip
+        case uop_pushx: // pushx
+        {
+            u64 sp = ra->template read<u64>() - opsz;
+            void* val = nullptr;
+
+            switch(re.op.imm)
+            {
+                default: break;
+                case px_flags:
+                    val = (void*)ccu;
+                    break;
+                case px_rip:
+                    // save sequential address
+                    re.op.imm = re.mref.vaddr;
+                    val = &re.op.imm;
+                    break;
+            }
+
+            re.mref = { val, opsz, sp, MM::mr_write, MM::mr_unavail };
+            rd->template write<u64>(sp);
+
+            break; // store can commit
+        }
+
+
+        // copy register content from rb to rd, dependence in ra
+        // immediate controls source width for sign extension (set rd_extend)
+        case uop_move: // move
+            switch(opsz)
+            {
+                default:
+                case 8:
+                    if(re.op.control & rd_extend) asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [rb]"rm"(sx(rb->template read<u64>(), re.op.imm, 8)));
+                    else asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [rb]"rm"(*(u64*)rb));
+                    break;
+                case 4:
+                    if(re.op.control & rd_extend) asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [rb]"rm"((u32)sx(rb->template read<u32>(), re.op.imm, 4)));
+                    else asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [rb]"rm"(*(u32*)rb));
+                    break;
+                case 2:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    
+                    if(re.op.control & rd_extend) asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [rb]"rm"((u16)sx(rb->template read<u16>(), re.op.imm, 2)));
+                    else asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [rb]"rm"(*(u16*)rb));
+                    break;
+                case 1:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    
+                    asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*((u8*)rd + dst_offs))
+                        : [rb]"rm"(*((u8*)rb + src_offs)));
+                    break;
+            }
+            break;
+
+
+        // copy full registers, assume dependences are already written!
+        case uop_copy2:
+            if(!u_ra || !u_rb || !d_rc) break; // misformed operands
+
+            asm("mov %[rc], %[ra]; mov %[rd], %[rb]"
+                : [rc]"=rm"(*(u64*)rc), [rd]"=rm"(*(u64*)rd)
+                : [ra]"rm"(*(u64*)ra), [rb]"rm"(*(u64*)rb));
+            break;
+
+
+        // ra -> rc, rb -> rd
+        // normal usage: &ra == &rd, &rb == &rc
+        case uop_xchg:
+            if(!d_rc) [[unlikely]] break; // one output doesn't make sense here
+            switch(opsz)
+            {
+                default:
+                case 8:
+                    asm("mov %[rc], %[ra]; mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u64*)rd), [rc]"=rm"(*(u64*)rc)
+                        : [rb]"rm"(*(u64*)rb), [ra]"rm"(*(u64*)ra));
+                    break;
+                case 4:
+                    asm("mov %[rc], %[ra]; mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u32*)rd), [rc]"=rm"(*(u32*)rc)
+                        : [rb]"rm"(*(u32*)rb), [ra]"rm"(*(u32*)ra));
+                    break;
+                case 2:
+                    // dependence on upper 6 bytes
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]; mov %[rc], %[rb]"
+                        : [rd]"=rm"(*(u64*)rd), [rc]"=rm"(*(u64*)rc)
+                        : [rb]"rm"(*(u64*)rb), [ra]"rm"(*(u64*)ra));
+
+                    // swap low words
+                    asm("mov %[rc], %[ra]; mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u16*)rd), [rc]"=rm"(*(u16*)rc)
+                        : [rb]"rm"(*(u16*)rb), [ra]"rm"(*(u16*)ra));
+                    break;
+                case 1:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]; mov %[rc], %[rb]"
+                        : [rd]"=rm"(*(u64*)rd), [rc]"=rm"(*(u64*)rc)
+                        : [rb]"rm"(*(u64*)rb), [ra]"rm"(*(u64*)ra));
+
+                    asm("mov %[rc], %[ra]; mov %[rd], %[rb]"
+                        : [rd]"=rm"(*((u8*)rd + dst_offs)), [rc]"=rm"(*((u8*)rc + src_offs))
+                        : [rb]"rm"(*((u8*)rb + src_offs)), [ra]"rm"(*((u8*)ra + dst_offs)));
+                    break;
+            }
+            break;
+
+
+        // set dst reg(s) to immediate
+        // rc/rd = (ra)°imm
+        case uop_set: // set
+        {
+            // TODO sign extend
+            if(u_ra) // set with dependence on register, opsz bytes are used from imm
+            {
+                u64 val_a = ra->template read<u64>();
+                rd->template write<u64>((val_a & ~bitmask(opsz * 8)) | (re.op.imm & bitmask(opsz * 8)));
+            }
+            else
+            {
+                if(d_rc) rc->template write<u64>(re.op.imm);
+                rd->template write<u64>(re.op.imm, dst_offs);
+            }
+            break;
+        }
+
+
+        case uop_movo ... (uop_movo + 0xf): // movcc
+            if(!test_cc((re.op.opcode & 0xf), ccu->template read<u64>()))
+                break;
+
+            else switch(opsz)
+            {
+                default:
+                case 8:
+                    asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [rb]"rm"(*(u64*)rb));
+                    break;
+                case 4:
+                    asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [rb]"rm"(*(u32*)rb));
+                    break;
+                case 2:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    
+                    else asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [rb]"rm"(*(u16*)rb));
+                    break;
+            }
+            break;
+
+
+        // branches are handled at commit:
+        // branch relative:  re.mref.mode = mr_rel,    re.mref.vaddr = offset (signed!)
+        // branch absolute:  re.mref.mode = mr_branch, re.mref.vaddr = target
+        // branch not taken: re.mref.size = -1 
+
+        case uop_branch: // branch direct
+        {
+            u64 target = u_ra ? ra->template read<u64>() : re.op.imm;
+            util::log(LOG_CORE_UOP, "          direct branch to v.", hex_u<64>, target);
+            re.mref = { nullptr, 0, target, MM::mr_branch, MM::mr_unavail };
+            break;
+        }
+
+
+        case uop_branchr: // branch relative
+            [[fallthrough]];
+
+        case uop_branchrz: // branch if ra == 0
+            [[fallthrough]];
+
+        // conditional branch:
+        // condition code is encode in low nibble of the opcode
+        // - should be tested against condition register
+        // this branch is always relative
+        case uop_brancho ... (uop_brancho + 0xf): // branchcc
+        {
+            re.op.imm  = sx(re.op.imm, opsz, ADDR_SIZE/8);
+            u64 target = (i64)re.mref.vaddr + (i64)re.op.imm;
+            u8  invd   = 0;
+
+            util::log(LOG_CORE_UOP, "          rip-relative branch before v.", hex_u<64>, re.mref.vaddr,
+                " target v.", hex_u<64>, target);
+
+            re.mref    = { nullptr, 0, target, MM::mr_branch, MM::mr_unavail };
+
+            if(re.op.opcode == uop_branchrz)
+            {
+                if(opsz == 4) invd = ra->template read<u32>();
+                else          invd = ra->template read<u64>();
+            }
+
+            // condition not met -> not taken
+            if(invd || !test_cc((re.op.opcode & 0xf), ccu->template read<u64>()))
+                re.mref.size = UINT64_MAX;
+            break;
+        }
+
+
+        // set allocated condition register to cc in imm
+        case uop_setcond: // setcc
+            if(re.op.control & set_cond) set_cc(re.cc_set, re.op.imm);
+            break;
+
+
+        // merge flag modifiers
+        case uop_cmc:
+            asm(setx64flags "cmc" getx64flags
+                : [ccs]"=rm"(*(u64*)ccs)
+                : [ccu]"rm"(*(u64*)ccu));
+            flags = 1; // don't gather flags later
+            break;
+
+
+        case uop_clc:
+            asm(setx64flags "clc" getx64flags
+                : [ccs]"=rm"(*(u64*)ccs)
+                : [ccu]"rm"(*(u64*)ccu));
+            flags = 1;
+            break;
+
+
+        case uop_stc:
+            asm(setx64flags "stc" getx64flags
+                : [ccs]"=rm"(*(u64*)ccs)
+                : [ccu]"rm"(*(u64*)ccu));
+            flags = 1;
+            break;
+
+
+        case uop_cld:
+            asm(setx64flags "cld" getx64flags
+                : [ccs]"=rm"(*(u64*)ccs)
+                : [ccu]"rm"(*(u64*)ccu));
+            flags = 1;
+            break;
+
+
+        case uop_std:
+            asm(setx64flags "std" getx64flags
+                : [ccs]"=rm"(*(u64*)ccs)
+                : [ccu]"rm"(*(u64*)ccu));
+            flags = 1;
+            break;
+
+
+        case uop_nop_a: // nop.alu
+            break;
+
+
+        case uop_add: // add
+            switch(opsz)
+            {
+                default: // r/w entire GP register
+                case 8:
+                {
+                    i64 acc = 0;
+                    if(u_ra) asm("add %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(i64*)ra));
+
+                    if(u_rb) asm("add %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i64*)rb));
+
+                    if(u_rc) asm("add %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i64*)rc));
+
+                    if(u_im) asm("add %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i64)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [acc]"rm"(acc));
+                    break;
+                }
+                case 4: // "lower" dword, always extend for x64
+                {
+                    i32 acc = 0;
+                    if(u_ra) asm("add %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(i32*)ra));
+
+                    if(u_rb) asm("add %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i32*)rb));
+
+                    if(u_rc) asm("add %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i32*)rc));
+
+                    if(u_im) asm("add %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i32)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i32*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 2: // "lower" word
+                {
+                    i16 acc = 0;
+                    if(u_ra) asm("add %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(i16*)ra));
+
+                    if(u_rb) asm("add %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i16*)rb));
+
+                    if(u_rc) asm("add %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i16*)rc));
+
+                    if(u_im) asm("add %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i16)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~bitmask(opsz * 8);
+                        rd->template write<i64>(res | (acc & bitmask(opsz * 8)));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>((i64)acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i16*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 1: // lowest byte
+                {
+                    i8 acc = 0;
+                    if(u_ra) asm("add %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*((i8*)ra + dst_offs)));
+
+                    if(u_rb) asm("add %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*((i8*)rb + src_offs)));
+
+                    if(u_rc) asm("add %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*((i8*)rc + src_offs)));
+
+                    if(u_im) asm("add %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i8)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~(bitmask(8) << dst_offs*8);
+                        rd->template write<i64>(res | (((i16)acc << dst_offs*8) & (bitmask(8)) << dst_offs*8));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>(acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*((i8*)rd + dst_offs))
+                            : [acc]"rm"(acc));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_adc: // adc
+        {
+            u64 flags = *(u64*)ccu; // intra uop flags are needed here
+            switch(opsz)
+            {
+                default: // r/w entire GP register
+                case 8:
+                {
+                    i64 acc = 0;
+                    if(u_ra) {
+                        asm(setx64flags "adc %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(i64*)ra), [ccu]"rm"(flags));
+                        flags = tmpflags[0];
+                    }
+
+                    if(u_rb) { 
+                        asm(setx64flags "adc %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i64*)rb), [ccu]"rm"(flags));
+                        flags = tmpflags[1];
+                    }
+
+                    if(u_rc) { 
+                        asm(setx64flags "adc %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i64*)rc), [ccu]"rm"(flags));
+                        flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "adc %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i64)re.op.imm), [ccu]"rm"(flags));
+
+                    asm("mov %[rd], %[acc]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [acc]"rm"(acc));
+                    break;
+                }
+                case 4: // "lower" dword, always extend for x64
+                {
+                    i32 acc = 0;
+                    if(u_ra) {
+                        asm(setx64flags "adc %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(i32*)ra), [ccu]"rm"(flags));
+                        flags = tmpflags[0];
+                    }
+
+                    if(u_rb) { 
+                        asm(setx64flags "adc %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i32*)rb), [ccu]"rm"(flags));
+                        flags = tmpflags[1];
+                    }
+
+                    if(u_rc) { 
+                        asm(setx64flags "adc %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i32*)rc), [ccu]"rm"(flags));
+                        flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "adc %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i32)re.op.imm), [ccu]"rm"(flags));
+
+                    asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i32*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 2: // "lower" word
+                {
+                    i16 acc = 0;
+                    if(u_ra) {
+                        asm(setx64flags "adc %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(i16*)ra), [ccu]"rm"(flags));
+                        flags = tmpflags[0];
+                    }
+
+                    if(u_rb) { 
+                        asm(setx64flags "adc %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i16*)rb), [ccu]"rm"(flags));
+                        flags = tmpflags[1];
+                    }
+
+                    if(u_rc) { 
+                        asm(setx64flags "adc %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i16*)rc), [ccu]"rm"(flags));
+                        flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "adc %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i16)re.op.imm), [ccu]"rm"(flags));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~bitmask(opsz * 8);
+                        rd->template write<i64>(res | (acc & bitmask(opsz * 8)));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>((i64)acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i16*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 1: // lowest byte
+                {
+                    i8 acc = 0;
+                    if(u_ra) {
+                        asm(setx64flags "adc %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(i8*)ra), [ccu]"rm"(flags));
+                        flags = tmpflags[0];
+                    }
+
+                    if(u_rb) { 
+                        asm(setx64flags "adc %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i8*)rb), [ccu]"rm"(flags));
+                        flags = tmpflags[1];
+                    }
+
+                    if(u_rc) { 
+                        asm(setx64flags "adc %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i8*)rc), [ccu]"rm"(flags));
+                        flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "adc %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i8)re.op.imm), [ccu]"rm"(flags));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~(bitmask(8) << dst_offs*8);
+                        rd->template write<i64>(res | (((i16)acc << dst_offs*8) & (bitmask(8)) << dst_offs*8));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>(acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*((i8*)rd + dst_offs))
+                            : [acc]"rm"(acc));
+                    break;
+                }
+            }
+            break;
+        }
+
+
+        case uop_sub:
+            switch(opsz)
+            {
+                default: // r/w entire GP register
+                case 8:
+                {
+                    // first used source as 'accumulator'
+                    i64 acc = u_ra ? *(i64*)ra : ( u_rb ? *(i64*)rb : ( u_rc ? *(i64*)rc : 0));
+
+                    // use operands in a cascading fashion or we always subtract from zero
+                    if(u_rb && u_ra) asm("sub %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i64*)rb));
+
+                    if(u_rc && (u_rb || u_ra)) asm("sub %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i64*)rc));
+
+                    if(u_im) asm("sub %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i64)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [acc]"rm"(acc));
+                    break;
+                }
+                case 4: // "lower" dword, always extend for x64
+                {
+                    i32 acc = u_ra ? *(i32*)ra : ( u_rb ? *(i32*)rb : ( u_rc ? *(i32*)rc : 0));
+
+                    if(u_rb && u_ra) asm("sub %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i32*)rb));
+
+                    if(u_rc && (u_rb || u_ra)) asm("sub %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i32*)rc));
+
+                    if(u_im) asm("sub %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i32)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i32*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 2: // "lower" word
+                {
+                    i16 acc = u_ra ? *(i16*)ra : ( u_rb ? *(i16*)rb : ( u_rc ? *(i16*)rc : 0));
+
+                    if(u_rb && u_ra) asm("sub %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i16*)rb));
+
+                    if(u_rc && (u_rb || u_ra)) asm("sub %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i16*)rc));
+
+                    if(u_im) asm("sub %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i16)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~bitmask(opsz * 8);
+                        rd->template write<i64>(res | (acc & bitmask(opsz * 8)));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>((i64)acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i16*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 1: // lowest byte
+                {
+                    i8 acc = u_ra ? *((i8*)ra + src_offs) :
+                        ( u_rb ? *((i8*)rb + src_offs) :
+                        ( u_rc ? *((i8*)rc + src_offs) : 0));
+
+                    if(u_rb && u_ra) asm("sub %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i8*)rb));
+
+                    if(u_rc && (u_rb || u_ra)) asm("sub %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i8*)rc));
+
+                    if(u_im) asm("sub %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i8)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~(bitmask(8) << dst_offs*8);
+                        rd->template write<i64>(res | (((i16)acc << dst_offs*8) & (bitmask(8)) << dst_offs*8));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>(acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*((i8*)rd + dst_offs))
+                            : [acc]"rm"(acc));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_sbb: // sbb
+        {
+            u64 flags = *(u64*)ccu; // see adc
+            switch(opsz)
+            {
+                default: // r/w entire GP register
+                case 8:
+                {
+                    i64 acc = u_ra ? *(i64*)ra : ( u_rb ? *(i64*)rb : ( u_rc ? *(i64*)rc : 0));
+
+                    if(u_rb && u_ra)
+                    {
+                        asm(setx64flags "sbb %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i64*)rb), [ccu]"rm"(flags));
+                        flags = tmpflags[1];
+                    }
+
+                    if(u_rc && (u_rb || u_ra)) 
+                    {
+                        asm(setx64flags "sbb %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i64*)rc), [ccu]"rm"(flags));
+                        flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "sbb %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i64)re.op.imm), [ccu]"rm"(flags));
+
+                    asm("mov %[rd], %[acc]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [acc]"rm"(acc));
+
+                    break;
+                }
+                case 4: // "lower" dword, always extend for x64
+                {
+                    i32 acc = u_ra ? *(i32*)ra : ( u_rb ? *(i32*)rb : ( u_rc ? *(i32*)rc : 0));
+
+                    if(u_rb && u_ra) 
+                    {
+                        asm(setx64flags "sbb %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(i32*)rb), [ccu]"rm"(flags));
+                        flags = tmpflags[1];
+                    }
+
+                    if(u_rc && (u_rb || u_ra))  
+                    {
+                        asm(setx64flags "sbb %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(i32*)rc), [ccu]"rm"(flags));
+                        flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "sbb %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i32)re.op.imm), [ccu]"rm"(flags));
+
+                    asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i32*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 2: // "lower" word
+                {
+                    i16 acc = u_ra ? *(i16*)ra : ( u_rb ? *(i16*)rb : ( u_rc ? *(i16*)rc : 0));
+
+                    if(u_rb && u_ra)
+                    { 
+                            asm(setx64flags "sbb %[acc], %[rb];" getx64flags
+                            : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                            : [rb]"rm"(*(i16*)rb), [ccu]"rm"(flags));
+                            flags = tmpflags[1];
+                    }
+
+                    if(u_rc && (u_rb || u_ra))
+                    {
+                            asm(setx64flags "sbb %[acc], %[rc];" getx64flags
+                            : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                            : [rc]"rm"(*(i16*)rc), [ccu]"rm"(flags));
+                            flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "sbb %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i16)re.op.imm), [ccu]"rm"(flags));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~bitmask(opsz * 8);
+                        rd->template write<i64>(res | (acc & bitmask(opsz * 8)));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>((i64)acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(i16*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 1: // lowest byte
+                {
+                    i8 acc = u_ra ? *((i8*)ra + src_offs) :
+                        ( u_rb ? *((i8*)rb + src_offs) :
+                        ( u_rc ? *((i8*)rc + src_offs) : 0));
+
+                    if(u_rb && u_ra)
+                    { 
+                            asm(setx64flags "sbb %[acc], %[rb];" getx64flags
+                            : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                            : [rb]"rm"(*(i8*)rb), [ccu]"rm"(flags));
+                            flags = tmpflags[1];
+                    }
+
+                    if(u_rc && (u_rb || u_ra))
+                    {
+                            asm(setx64flags "sbb %[acc], %[rc];" getx64flags
+                            : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                            : [rc]"rm"(*(i8*)rc), [ccu]"rm"(flags));
+                            flags = tmpflags[2];
+                    }
+
+                    if(u_im) asm(setx64flags "sbb %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((i8)re.op.imm), [ccu]"rm"(flags));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~(bitmask(8) << dst_offs*8);
+                        rd->template write<i64>(res | (((i16)acc << dst_offs*8) & (bitmask(8)) << dst_offs*8));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<i64>(acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*((i8*)rd + dst_offs))
+                            : [acc]"rm"(acc));
+                    break;
+                }
+            }
+            break;
+        }
+
+
+        case uop_neg: // negate: -(ra)
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                    asm("mov %[rd], %[ra]; neg %[rd]" getx64flags
+                        : [rd]"=rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u64*)ra));
+                    break;
+                case 4:
+                    asm("mov %[rd], %[ra]; neg %[rd]" getx64flags
+                        : [rd]"=rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u32*)ra));
+                    break;
+                case 2:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    asm("neg %[rd]" getx64flags
+                        : [rd]"=rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[0]));
+                    break;
+                case 1:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    asm("neg %[rd]" getx64flags
+                        : [rd]"=rm"(*(u8*)rd), [ccs]"=rm"(tmpflags[0]));
+                    break;
+            }
+            break;
+
+
+        case uop_mul: // mul a,s -> d,a (f6 /4)
+            switch(opsz)
+            {
+                default:
+                case 8: // r/w entire GP register
+                    asm("mul %[op]" getx64flags
+                        : "=a"(*(i64*)rd), "=d"(*(i64*)rc), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i64*)ra), [op]"rm"(*(i64*)rb));
+                    break;
+                case 4: // "lower" dword
+                    asm("mul %[op]" getx64flags
+                        : "=a"(*(i32*)rd), "=d"(*(i32*)rc), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i32*)ra), [op]"rm"(*(i32*)rb));
+                    break;
+                case 2: // "lower" word
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [ra]"rm"(*(i64*)ra));
+                    asm("mul %[op]" getx64flags
+                        : "=a"(*(i16*)rd), "=d"(*(i16*)rc), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i16*)ra), [op]"rm"(*(i16*)rb));
+                    break;
+                case 1: // lowest byte
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [ra]"rm"(*(i64*)ra));
+                    asm("mul %[op]" getx64flags
+                        : "=a"(*(i16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i8*)ra), [op]"rm"(*((i8*)rb + dst_offs)));
+                    break;
+            }
+            break;
+
+
+        case uop_imul: // imul a,s -> d,a (f7 /5) or r,s -> r (0faf) or r,i -> r (69)
+            switch(opsz)
+            {
+                default:
+                case 8:
+                    // imul r64, rm64, imm32/8 (69/6b)
+                    if(u_im) asm("mov %[rd], %[ra]; imul %[rd], %[op]" getx64flags
+                        : [rd]"=&rm"(*(i64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [ra]"rm"(*(i64*)ra), [op]"rm"(re.op.imm));
+
+                    // imul r64, rm64 (0faf)
+                    else if(!d_rc) asm("mov %[rd], %[ra]; imul %[rd], %[rb]" getx64flags
+                        : [rd]"=&rm"(*(i64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [ra]"rm"(*(i64*)ra), [rb]"rm"(*(i64*)rb));
+
+                    // imul rm64 (f7)
+                    else asm("imul %[op]" getx64flags
+                        : "=a"(*(i64*)rd), "=d"(*(i64*)rc), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i64*)ra), [op]"rm"(*(i64*)rb));
+                    break;
+                case 4:
+                    // imul r32, rm32, imm32/8 (69/6b)
+                    if(u_im) asm("mov %[rd], %[ra]; imul %[rd], %[op]" getx64flags
+                        : [rd]"=&rm"(*(i32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [ra]"rm"(*(i32*)ra), [op]"rm"((i32)re.op.imm));
+
+                    // imul r32, rm32 (0faf)
+                    else if(!d_rc) asm("mov %[rd], %[ra]; imul %[rd], %[rb]" getx64flags
+                        : [rd]"=&rm"(*(i32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [ra]"rm"(*(i32*)ra), [rb]"rm"(*(i32*)rb));
+
+                    // imul rm32 (f7)
+                    else asm("imul %[op]" getx64flags
+                        : "=a"(*(i32*)rd), "=d"(*(i32*)rc), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i32*)ra), [op]"rm"(*(i32*)rb));
+                    break;
+                case 2:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [ra]"rm"(*(i64*)ra));
+
+                    // imul r16, rm16, imm16/8 (69/6b)
+                    if(u_im) asm("mov %[rd], %[ra]; imul %[rd], %[op]" getx64flags
+                        : [rd]"=&rm"(*(i16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [ra]"rm"(*(i16*)ra), [op]"rm"((i16)re.op.imm));
+
+                    // imul r32, rm32 (0faf)
+                    else if(!d_rc) asm("mov %[rd], %[ra]; imul %[rd], %[rb]" getx64flags
+                        : [rd]"=&rm"(*(i16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [ra]"rm"(*(i16*)ra), [rb]"rm"(*(i16*)rb));
+
+                    // imul rm32 (f7)
+                    else asm("imul %[op]" getx64flags
+                        : "=a"(*(i16*)rd), "=d"(*(i16*)rc), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i16*)ra), [op]"rm"(*(i16*)rb));
+                    break;
+                case 1:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [ra]"rm"(*(i64*)ra));
+
+                    // imul rm8 (f6)
+                    asm("imul %[op]" getx64flags
+                        : "=a"(*(i16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : "a"(*(i8*)ra), [op]"rm"(*((i8*)rb + dst_offs)));
+            }
+            break;
+
+
+        case uop_div8:
+        {
+            if(!u_ra || !u_rb) break; // missing operands
+            
+            u16 a = ra->template read<u16>();
+            u8  b = rb->template read<u8>(dst_offs);
+
+            // divide by zero or too large result, this has to be checked before executing asm
+            if((b == 0) || ((a/b) & 0xff00))
+            {
+                re.except = ex_DE;
+                break;
+            }
+
+            if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                : [rd]"=rm"(*(u64*)rd)
+                : [ra]"rm"(*(u64*)ra));
+
+            asm("div %[op]"
+                : "=a"(*(u16*)rd)
+                : "a"(*(u16*)ra), [op]"rm"(*((u8*)rb + dst_offs)));
+            break;
+        }
+
+
+        case uop_divq:
+        {   // x64: a, d, source -> a
+            if(!u_ra || !u_rb || !u_rc) break; // missing operands
+
+            switch(opsz)
+            {   // this is the source operand size  
+                default:
+                case 8: // 128-bit division
+                {
+                    u64 l = ra->template read<u64>();
+                    u64 h = rb->template read<u64>();
+                    u64 divisor = rc->template read<u64>();
+                    u128 dividend = ((u128)h << 64) | l;
+
+                    // util::log(LOG_CORE_UOP, "div:: ", hex_u<64>, h, " ", hex_u<64>, l, " ", hex_u<128>, dividend, " ", hex_u<64>,
+                    //     divisor, " ", hex_u<128>, dividend/divisor);
+
+                    if(!divisor || ((dividend/divisor) >> 64))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("div %[op]"
+                        : "=a"(*(u64*)rd)
+                        : "a"(*(u64*)ra), "d"(*(u64*)rb), [op]"rm"(*(u64*)rc));
+                    break;
+                }
+                case 4:
+                {
+                    u32 l = ra->template read<u64>();
+                    u32 h = rb->template read<u64>();
+                    u32 divisor = rc->template read<u64>();
+                    u64 dividend = ((u64)h << 32) | l;
+
+                    if(!divisor || ((dividend/divisor) >> 32))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("div %[op]"
+                        : "=a"(*(u32*)rd)
+                        : "a"(*(u32*)ra), "d"(*(u32*)rb), [op]"rm"(*(u32*)rc));
+                    break;
+                }
+                case 2:
+                {
+                    u16 l = ra->template read<u64>();
+                    u16 h = rb->template read<u64>();
+                    u16 divisor = rc->template read<u64>();
+                    u32 dividend = ((u32)h << 16) | l;
+
+                    if(!divisor || ((dividend/divisor) >> 16))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    asm("div %[op]"
+                        : "=a"(*(u16*)rd)
+                        : "a"(*(u16*)ra), "d"(*(u16*)rb), [op]"rm"(*(u16*)rc));
+                    break;
+                }
+            }
+            break;
+        }
+
+
+        case uop_divr:
+        {   // x64: a, d, source -> d
+            if(!u_ra || !u_rb || !u_rc) break; // missing operands
+
+            switch(opsz)
+            {
+                default:
+                case 8: // 128-bit division
+                {
+                    u64 l = ra->template read<u64>();
+                    u64 h = rb->template read<u64>();
+                    u64 divisor = rc->template read<u64>();
+                    u128 dividend = ((u128)h << 64) | l;
+
+                    // util::log(LOG_CORE_UOP, "div:: ", hex_u<64>, h, " ", hex_u<64>, l, " ", hex_u<128>, dividend, " ", hex_u<64>,
+                    //     divisor, " ", hex_u<128>, dividend/divisor);
+
+                    if(!divisor || ((dividend/divisor) >> 64))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("div %[op]"
+                        : "=d"(*(u64*)rd)
+                        : "a"(*(u64*)ra), "d"(*(u64*)rb), [op]"rm"(*(u64*)rc));
+                    break;
+                }
+                case 4:
+                {
+                    u32 l = ra->template read<u32>();
+                    u32 h = rb->template read<u32>();
+                    u32 divisor = rc->template read<u32>();
+                    u64 dividend = ((u64)h << 32) | l;
+
+                    if(!divisor || ((dividend/divisor) >> 32))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("div %[op]"
+                        : "=d"(*(u32*)rd)
+                        : "a"(*(u32*)ra), "d"(*(u32*)rb), [op]"rm"(*(u32*)rc));
+                    break;
+                }
+                case 2:
+                {
+                    u16 l = ra->template read<u16>();
+                    u16 h = rb->template read<u16>();
+                    u16 divisor = rc->template read<u16>();
+                    u32 dividend = ((u32)h << 16) | l;
+
+                    if(!divisor || ((dividend/divisor) >> 16))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [rb]"rm"(*(u64*)rb));
+
+                    asm("div %[op]"
+                        : "=d"(*(u16*)rd)
+                        : "a"(*(u16*)ra), "d"(*(u16*)rb), [op]"rm"(*(u16*)rc));
+                    break;
+                }
+            }
+            break;
+        }
+
+
+        case uop_idiv8:
+        {
+            if(!u_ra || !u_rb) break; // missing operands
+            
+            i16 a = ra->template read<i16>();
+            i8  b = rb->template read<i8>(dst_offs);
+
+            if((b == 0) || ((a/b) > 0x7f) || ((a/b) < 0x80))
+            {
+                re.except = ex_DE;
+                break;
+            }
+
+            if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                : [rd]"=rm"(*(i64*)rd)
+                : [ra]"rm"(*(i64*)ra));
+
+            asm("idiv %[op]"
+                : "=a"(*(i16*)rd)
+                : "a"(*(i16*)ra), [op]"rm"(*((i8*)rb + dst_offs)));
+            break;
+        }
+
+
+        case uop_idivq:
+        {   // x64: a, d, source -> a
+            if(!u_ra || !u_rb || !u_rc) break; // missing operands
+
+            switch(opsz)
+            {   // this is the source operand size  
+                default:
+                case 8: // 128-bit division
+                {
+                    i64 l = ra->template read<i64>();
+                    i64 h = rb->template read<i64>();
+                    i64 divisor = rc->template read<i64>();
+                    i128 dividend = ((i128)h << 64) | l;
+
+                    if(!divisor || ((dividend/divisor) > INT64_MAX) || ((dividend/divisor) < INT64_MIN))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("idiv %[op]"
+                        : "=a"(*(i64*)rd)
+                        : "a"(*(i64*)ra), "d"(*(i64*)rb), [op]"rm"(*(i64*)rc));
+                    break;
+                }
+                case 4:
+                {
+                    i32 l = ra->template read<i32>();
+                    i32 h = rb->template read<i32>();
+                    i32 divisor = rc->template read<i32>();
+                    i64 dividend = ((i64)h << 32) | l;
+
+                    if(!divisor || ((dividend/divisor) > INT32_MAX) || ((dividend/divisor) < INT32_MIN))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("idiv %[op]"
+                        : "=a"(*(i32*)rd)
+                        : "a"(*(i32*)ra), "d"(*(i32*)rb), [op]"rm"(*(i32*)rc));
+                    break;
+                }
+                case 2:
+                {
+                    i16 l = ra->template read<i16>();
+                    i16 h = rb->template read<i16>();
+                    i16 divisor = rc->template read<i16>();
+                    i32 dividend = ((i32)h << 16) | l;
+
+                    if(!divisor || ((dividend/divisor) > INT16_MAX) || ((dividend/divisor) < INT16_MIN))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [ra]"rm"(*(i64*)ra));
+
+                    asm("idiv %[op]"
+                        : "=a"(*(i16*)rd)
+                        : "a"(*(i16*)ra), "d"(*(i16*)rb), [op]"rm"(*(i16*)rc));
+                    break;
+                }
+            }
+            break;
+        }
+
+
+        case uop_idivr:
+        {   // x64: a, d, source -> d
+            if(!u_ra || !u_rb || !u_rc) break; // missing operands
+
+            switch(opsz)
+            {
+                default:
+                case 8: // 128-bit division
+                {
+                    i64 l = ra->template read<i64>();
+                    i64 h = rb->template read<i64>();
+                    i64 divisor = rc->template read<i64>();
+                    i128 dividend = ((i128)h << 64) | l;
+
+                    if(!divisor || ((dividend/divisor) > INT64_MAX) || ((dividend/divisor) < INT64_MIN))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("idiv %[op]"
+                        : "=d"(*(i64*)rd)
+                        : "a"(*(i64*)ra), "d"(*(i64*)rb), [op]"rm"(*(i64*)rc));
+                    break;
+                }
+                case 4:
+                {
+                    i32 l = ra->template read<i32>();
+                    i32 h = rb->template read<i32>();
+                    i32 divisor = rc->template read<i32>();
+                    i64 dividend = ((i64)h << 32) | l;
+
+                    if(!divisor || ((dividend/divisor) > INT32_MAX) || ((dividend/divisor) < INT32_MIN))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    else asm("idiv %[op]"
+                        : "=d"(*(i32*)rd)
+                        : "a"(*(i32*)ra), "d"(*(i32*)rb), [op]"rm"(*(i32*)rc));
+                    break;
+                }
+                case 2:
+                {
+                    i16 l = ra->template read<i16>();
+                    i16 h = rb->template read<i16>();
+                    i16 divisor = rc->template read<i16>();
+                    i32 dividend = ((i32)h << 16) | l;
+
+                    if(!divisor || ((dividend/divisor) > INT16_MAX) || ((dividend/divisor) < INT16_MIN))
+                    {
+                        re.except = ex_DE;
+                        break;
+                    }
+
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[rb]"
+                        : [rd]"=rm"(*(i64*)rd)
+                        : [rb]"rm"(*(i64*)rb));
+
+                    asm("idiv %[op]"
+                        : "=d"(*(i16*)rd)
+                        : "a"(*(i16*)ra), "d"(*(i16*)rb), [op]"rm"(*(i16*)rc));
+                    break;
+                }
+            }
+            break;
+        }
+
+
+        // shifts and rotates
+        // shifts will use 5 bits (6 if opsz == 8), so we don't need to encode size
+
+        case uop_lsl: // left shift by rb/imm
+            if(!u_ra) break; // nothing to shift
+            switch(opsz)
+            {
+                default:
+                case 8:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("shl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("shl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+                case 4:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("shl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("shl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 2:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("shl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("shl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 1:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("shl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("shl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_rsl: // right shift by rb/imm
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("shr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("shr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+                case 4:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("shr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("shr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 2:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("shr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("shr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 1:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("shr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("shr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_rsa: // right shift arithmetic by rb/imm
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("sar %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("sar %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+                case 4:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("sar %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("sar %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 2:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("sar %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("sar %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 1:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("sar %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("sar %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_rol: // rotate left
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("rol %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("rol %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+                case 4:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("rol %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("rol %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 2:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("rol %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("rol %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 1:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("rol %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("rol %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_ror: // rotate right
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("ror %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("ror %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+                case 4:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("ror %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("ror %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 2:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("ror %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111));
+
+                    else if(u_im) asm("ror %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111));
+                    break;
+                }
+                case 1:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("ror %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111));
+
+                    else if(u_im) asm("ror %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_rcl: // rotate left + carry
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm(setx64flags "rcl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+                case 4:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm(setx64flags "rcl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+                case 2:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm(setx64flags "rcl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+                case 1:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm(setx64flags "rcl %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcl %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_rcr: // rotate right + carry
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm(setx64flags "rcr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u64*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+                case 4:
+                {
+                    asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm(setx64flags "rcr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u32*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+                case 2:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm(setx64flags "rcr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b11111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*(u16*)rd), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b11111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+                case 1:
+                {
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm(setx64flags "rcr %[rd], %[rb];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"c"(*(u8*)rb & 0b111111), [ccu]"rm"(*(u64*)ccu));
+
+                    else if(u_im) asm(setx64flags "rcr %[rd], %[im];" getx64flags
+                        : [rd]"+rm"(*((u8*)rd + dst_offs)), [ccs]"=rm"(tmpflags[3])
+                        : [im]"c"((u8)re.op.imm & 0b111111), [ccu]"rm"(*(u64*)ccu));
+                    break;
+                }
+            }
+            break;
+
+
+
+
+
+
+
+
+
+        case uop_not: // bitwise not: ~ra
+            if(!u_ra) break;
+            switch(opsz)
+            {
+                default:
+                case 8:
+                    asm("mov %[rd], %[ra]; not %[rd]"
+                        : [rd]"=&rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    break;
+                case 4:
+                    asm("mov %[rd], %[ra]; not %[rd]"
+                        : [rd]"=&rm"(*(u32*)rd)
+                        : [ra]"rm"(*(u32*)ra));
+                    break;
+                case 2:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u16*)rd)
+                        : [ra]"rm"(*(u16*)ra));
+
+                    asm("not %[rd]"
+                        : [rd]"=rm"(*(u16*)rd));
+                    break;
+                case 1:
+                    if(re.op.control & rd_resize) asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [ra]"rm"(*(u64*)ra));
+                    else asm("mov %[rd], %[ra]"
+                        : [rd]"=rm"(*(u8*)rd)
+                        : [ra]"rm"(*(u8*)ra));
+
+                    asm("not %[rd]"
+                        : [rd]"=rm"(*(u8*)rd));
+                    break;
+            }
+            break;
+
+
+
+
+
+
+
+
+
+
+        case uop_and: // bitwise and: ra & rb & (rc) & imm
+            switch(opsz)
+            {
+                default: // r/w entire GP register
+                case 8:
+                {
+                    u64 acc = -1; // 0xff..ff as neutral element for AND
+                    if(u_ra) asm("and %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("and %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u64*)rb));
+
+                    if(u_rc) asm("and %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u64*)rc));
+
+                    if(u_im) asm("and %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u64)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [acc]"rm"(acc));
+                    break;
+                }
+                case 4: // "lower" dword, always extend for x64
+                {
+                    u32 acc = -1;
+                    if(u_ra) asm("and %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("and %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u32*)rb));
+
+                    if(u_rc) asm("and %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u32*)rc));
+
+                    if(u_im) asm("and %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u32)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(u32*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 2: // "lower" word
+                {
+                    u16 acc = -1;
+                    if(u_ra) asm("and %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("and %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u16*)rb));
+
+                    if(u_rc) asm("and %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u16*)rc));
+
+                    if(u_im) asm("and %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u16)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        u64 res = ra->template read<u64>() & ~bitmask(opsz * 8);
+                        rd->template write<u64>(res | (acc & bitmask(opsz * 8)));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<u64>((u64)acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(u16*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 1: // lowest byte
+                {
+                    u8 acc = -1;
+                    if(u_ra) asm("and %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("and %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u8*)rb));
+
+                    if(u_rc) asm("and %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u8*)rc));
+
+                    if(u_im) asm("and %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u8)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~(bitmask(8) << dst_offs*8);
+                        rd->template write<i64>(res | (((i16)acc << dst_offs*8) & (bitmask(8)) << dst_offs*8));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<u64>(acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*((u8*)rd + dst_offs))
+                            : [acc]"rm"(acc));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_or: // bitwise or: ra | rb | (rc) | imm
+            switch(opsz)
+            {
+                default: // r/w entire GP register
+                case 8:
+                {
+                    u64 acc = 0;
+                    if(u_ra) asm("or %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("or %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u64*)rb));
+
+                    if(u_rc) asm("or %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u64*)rc));
+
+                    if(u_im) asm("or %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u64)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [acc]"rm"(acc));
+                    break;
+                }
+                case 4: // "lower" dword, always extend for x64
+                {
+                    u32 acc = 0;
+                    if(u_ra) asm("or %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("or %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u32*)rb));
+
+                    if(u_rc) asm("or %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u32*)rc));
+
+                    if(u_im) asm("or %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u32)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(u32*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 2: // "lower" word
+                {
+                    u16 acc = 0;
+                    if(u_ra) asm("or %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("or %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u16*)rb));
+
+                    if(u_rc) asm("or %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u16*)rc));
+
+                    if(u_im) asm("or %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u16)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        u64 res = ra->template read<u64>() & ~bitmask(opsz * 8);
+                        rd->template write<u64>(res | (acc & bitmask(opsz * 8)));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<u64>((u64)acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(u16*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 1: // lowest byte
+                {
+                    u8 acc = 0;
+                    if(u_ra) asm("or %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("or %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u8*)rb));
+
+                    if(u_rc) asm("or %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u8*)rc));
+
+                    if(u_im) asm("or %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u8)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~(bitmask(8) << dst_offs*8);
+                        rd->template write<i64>(res | (((i16)acc << dst_offs*8) & (bitmask(8)) << dst_offs*8));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<u64>(acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*((u8*)rd + dst_offs))
+                            : [acc]"rm"(acc));
+                    break;
+                }
+            }
+            break;
+
+
+        case uop_xor: // bitwise xor: ra ^ rb ^ (rc) ^ imm
+            switch(opsz)
+            {
+                default: // r/w entire GP register
+                case 8:
+                {
+                    u64 acc = 0;
+                    if(u_ra) asm("xor %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u64*)ra));
+
+                    if(u_rb) asm("xor %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u64*)rb));
+
+                    if(u_rc) asm("xor %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u64*)rc));
+
+                    if(u_im) asm("xor %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u64)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                        : [rd]"=rm"(*(u64*)rd)
+                        : [acc]"rm"(acc));
+                    break;
+                }
+                case 4: // "lower" dword, always extend for x64
+                {
+                    u32 acc = 0;
+                    if(u_ra) asm("xor %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u32*)ra));
+
+                    if(u_rb) asm("xor %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u32*)rb));
+
+                    if(u_rc) asm("xor %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u32*)rc));
+
+                    if(u_im) asm("xor %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u32)re.op.imm));
+
+                    asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(u32*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 2: // "lower" word
+                {
+                    u16 acc = 0;
+                    if(u_ra) asm("xor %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u16*)ra));
+
+                    if(u_rb) asm("xor %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u16*)rb));
+
+                    if(u_rc) asm("xor %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u16*)rc));
+
+                    if(u_im) asm("xor %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u16)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        u64 res = ra->template read<u64>() & ~bitmask(opsz * 8);
+                        rd->template write<u64>(res | (acc & bitmask(opsz * 8)));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<u64>((u64)acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*(u16*)rd)
+                            : [acc]"rm"(acc));
+                    break;
+                }
+                case 1: // lowest byte
+                {
+                    u8 acc = 0;
+                    if(u_ra) asm("xor %[acc], %[ra];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[0])
+                        : [ra]"rm"(*(u8*)ra));
+
+                    if(u_rb) asm("xor %[acc], %[rb];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[1])
+                        : [rb]"rm"(*(u8*)rb));
+
+                    if(u_rc) asm("xor %[acc], %[rc];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[2])
+                        : [rc]"rm"(*(u8*)rc));
+
+                    if(u_im) asm("xor %[acc], %[im];" getx64flags
+                        : [acc]"+rm"(acc), [ccs]"=rm"(tmpflags[3])
+                        : [im]"rm"((u8)re.op.imm));
+
+                    if(re.op.control & rd_resize)
+                    {
+                        i64 res = ra->template read<i64>() & ~(bitmask(8) << dst_offs*8);
+                        rd->template write<i64>(res | (((i16)acc << dst_offs*8) & (bitmask(8)) << dst_offs*8));
+                    }
+                    else if(re.op.control & rd_extend)
+                        rd->template write<u64>(acc);
+                    else asm("mov %[rd], %[acc]"
+                            : [rd]"=rm"(*((u8*)rd + dst_offs))
+                            : [acc]"rm"(acc));
+                    break;
+                }
+            }
+            break;
+
+
+
+
+
+        case uop_ld_v: // ld.v
+        {
+            u64 vaddr = 0;
+            // ..
+            if(vaddr % opsz)
+            {
+                re.except = setExcept(ex_AV, opsz);
+                break;
+            }
+            // ..
+            break;
+        }
+    }
+
+    if(!flags)
+    {
+        // overflow, carry should be set if it occured anywhere in the uop since they are lost otherwise
+        flags = (tmpflags[0] | tmpflags[1] | tmpflags[2] | tmpflags[3])
+        & (cc_OF | cc_CF);
+
+        // combine with last written flags    
+        u8 lastflag = [&]() {
+            for(u8 i = 0; i < 4; i++)
+                if(re.op.control & (use_ra << (3-i)))
+                    return (use_ra << (3-i));
+            return 0;
+        }();
+
+        ccs->template write<u64>(flags | tmpflags[util::ld.at(lastflag)]);
+    }
+
+    re.c_ready = state.cycle + delay; // commit ready next cycle, or after set delay
+    return 0;
+}
+
+template<u8 N>
+std::ostream& operator<<(std::ostream& os, const Register<N>& reg)
+{
+    // endianness?
+    for(u8 i = N; i > 0; i--) // assume little (for now)
+        os << hex_u<8> << +std::to_integer<u8>(reg.content.b[i-1]) << ((i == 33) ? "\n     " : "");
+    // fix that vr linebreak hack at some point..
+
+    return os;
+}
+
+#endif

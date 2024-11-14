@@ -1,0 +1,132 @@
+// o3 RISC simulator
+// 
+// types
+// - template implementation
+//
+// Lukas Heine 2021
+
+#include <iomanip>
+
+template<typename T>
+LatchQueue<T>::LatchQueue(u32 max_size) : max_size(max_size) {}
+
+// check if inputs are ready, use to enforce latencies
+template<typename T>
+bool LatchQueue<T>::ready(u64 request_cycle)
+{
+    // if(in.empty() || request_cycle >= in.front().cycle) return true;
+    if(queue.empty() || request_cycle >= queue.front().cycle) return true;
+    else return false;
+}
+
+// empty output queue
+template<typename T>
+bool LatchQueue<T>::empty()
+{   return queue.empty(); }
+
+// queue size
+template<typename T>
+size_t LatchQueue<T>::size()
+{   return queue.size(); }
+
+// clear the latch
+template<typename T>
+int LatchQueue<T>::clear()
+{
+    queue.clear();
+    return 0;
+}
+
+// push an element into the latch which will not be released earlier than the target cycle
+template<typename T>
+void LatchQueue<T>::push_back(u64 target_cycle, T elem)
+{
+    // if(in.size() >= max_size || out.size() > max_size)
+    if(queue.size() >= max_size)
+        throw LatchFullException();
+
+    LatchQElem lqe = { target_cycle, elem };
+    queue.push_back(lqe);
+}
+
+// get reference to last element without ready check
+template<typename T>
+T& LatchQueue<T>::back()
+{
+    return queue.back().elem;
+}
+
+template<typename T>
+void LatchQueue<T>::push_front(u64 target_cycle, T elem)
+{
+    if(queue.size() >= max_size)
+        throw LatchFullException();
+
+    LatchQElem lqe = { target_cycle, elem };
+    queue.push_front(lqe);
+}
+
+// get and pop element from the latch when the requested cycle matches the target one
+template<typename T>
+T LatchQueue<T>::get_front(u64 request_cycle)
+{
+    if(queue.empty()) throw LatchEmptyException();
+
+    if(request_cycle < queue.front().cycle) throw LatchStallException();
+
+    T tmp = queue.front().elem;
+    queue.pop_front();
+    return tmp;
+}
+
+// get reference to first (out) element when the requested cycle matches the target one
+template<typename T>
+T& LatchQueue<T>::front(u64 request_cycle)
+{
+    if(queue.empty()) throw LatchEmptyException();
+    if(request_cycle < queue.front().cycle) throw LatchStallException();
+
+    return queue.front().elem;
+}
+
+// remove first element
+template<typename T>
+void LatchQueue<T>::pop_front()
+{
+    if(queue.empty()) throw LatchEmptyException();
+
+    queue.pop_front();
+}
+
+// access element at index
+template<typename T>
+T& LatchQueue<T>::at(u64 request_cycle, u64 index)
+{
+    // stall?
+    // .at throws std::out_of_range
+    if(queue.empty()) throw LatchEmptyException();
+    if(request_cycle < queue.at(index).cycle) throw LatchStallException();
+    return queue.at(index).elem;
+}
+
+template<typename T>
+auto LatchQueue<T>::begin()
+{
+    return queue.begin();
+}
+
+template<typename T>
+auto LatchQueue<T>::end()
+{
+    return queue.end();
+}
+
+template<u64 N>
+std::ostream& operator<<(std::ostream& os, const wN<N>& word)
+{
+    for(u8 i = 0; i < N; i++)
+        os << std::hex << std::setw(2) << std::right << std::setfill('0')
+           << +std::to_integer<u8>(word.b[i]) << ((i == N-1) ? "" : " ");
+
+    return os;
+}

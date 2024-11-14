@@ -1,0 +1,5 @@
+# load and store to calculated address
+48 B8 0200000000000000 # mov rax, 2
+48 BB 0200000000000000 # mov rbx, 2
+48 03 04 9D 00001000   # add rax, [rbx*4 + 0x100000]
+48 01 18               # add [rax], rbx  <--- this should #PF
